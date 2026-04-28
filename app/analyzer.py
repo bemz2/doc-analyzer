@@ -117,7 +117,8 @@ class DocumentAnalyzer:
         total = len(chunks)
         
         # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Reduced max_workers to 2 to avoid rate limiting
+        with ThreadPoolExecutor(max_workers=2) as executor:
             # Submit all tasks
             future_to_chunk = {
                 executor.submit(

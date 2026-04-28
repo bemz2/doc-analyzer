@@ -87,7 +87,15 @@ class LLMClient:
     def _is_non_retryable_error(error: Exception) -> bool:
         """Avoid retrying authentication, permission, and bad model errors."""
         status_code = getattr(error, "status_code", None)
+        # Don't retry auth, permission, not found errors
+        # But DO retry rate limit errors (429)
         return status_code in {400, 401, 403, 404}
+    
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        """Check if error is a rate limit error."""
+        status_code = getattr(error, "status_code", None)
+        return status_code == 429
 
     def _format_llm_error(self, error: Exception) -> str:
         """Return a concise user-facing error while preserving provider context."""
@@ -102,6 +110,8 @@ class LLMClient:
             return f"{self.provider}: model or endpoint not found for '{self.model}'."
         if status_code == 400 and "model" in message.lower():
             return f"{self.provider}: model '{self.model}' is not available or does not support this request."
+        if status_code == 429:
+            return f"{self.provider}: rate limit exceeded. Too many requests. Please wait and try again."
         
         # Handle connection errors
         if "Connection" in message or "connection" in message.lower():
@@ -138,9 +148,17 @@ class LLMClient:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Attempt {attempt + 1} failed for chunk {chunk_id}: {str(e)}")
+                
+                # Don't retry auth/permission errors
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
-                if attempt < settings.max_retries - 1:
+                
+                # For rate limit errors, wait longer
+                if self._is_rate_limit_error(e):
+                    wait_time = settings.retry_delay * (attempt + 2)  # Exponential backoff
+                    logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry")
+                    time.sleep(wait_time)
+                elif attempt < settings.max_retries - 1:
                     time.sleep(settings.retry_delay)
                 else:
                     logger.error(f"All retries failed for chunk {chunk_id}")
@@ -171,9 +189,17 @@ class LLMClient:
             except Exception as e:
                 last_error = e
                 logger.warning(f"Global analysis attempt {attempt + 1} failed: {str(e)}")
+                
+                # Don't retry auth/permission errors
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
-                if attempt < settings.max_retries - 1:
+                
+                # For rate limit errors, wait longer
+                if self._is_rate_limit_error(e):
+                    wait_time = settings.retry_delay * (attempt + 2)  # Exponential backoff
+                    logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry")
+                    time.sleep(wait_time)
+                elif attempt < settings.max_retries - 1:
                     time.sleep(settings.retry_delay)
                 else:
                     logger.error("All retries failed for global analysis")
