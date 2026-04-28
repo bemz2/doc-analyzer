@@ -111,10 +111,14 @@ function App() {
     const progressInterval = setInterval(async () => {
       try {
         const progressData = await getProgress(uploadedFileId);
-        if (progressData.current > 0) {
-          const percentage = Math.round((progressData.current / progressData.total) * 100);
+        console.log('Progress data:', progressData);
+        if (progressData.completed > 0 && progressData.total > 0) {
+          const percentage = Math.round((progressData.completed / progressData.total) * 100);
           setProgress(percentage);
-          setProgressMessage(`Обработано ${progressData.current} из ${progressData.total} частей документа`);
+          setProgressMessage(`Обработано ${progressData.completed} из ${progressData.total} частей документа`);
+        } else if (progressData.progress > 0) {
+          setProgress(progressData.progress);
+          setProgressMessage(progressData.message || 'Обработка...');
         }
       } catch (err) {
         console.error('Progress fetch error:', err);

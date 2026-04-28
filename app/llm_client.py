@@ -137,6 +137,9 @@ class LLMClient:
         Returns:
             ChunkAnalysis object or None if failed
         """
+        # Add small delay to avoid rate limiting
+        time.sleep(0.5)
+        
         prompt = self._build_chunk_analysis_prompt(chunk_text, instructions)
         
         last_error = None
