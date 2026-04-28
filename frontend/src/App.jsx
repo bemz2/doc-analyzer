@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import FileUpload from './components/FileUpload';
 import ModelSettings from './components/ModelSettings';
 import Results from './components/Results';
-import { uploadDocument, analyzeDocument, getSettings, saveSettings } from './services/api';
+import { uploadDocument, analyzeDocument, getSettings, saveSettings, getProgress } from './services/api';
 
 const defaultLlmSettings = {
   openai: {
@@ -105,17 +105,28 @@ function App() {
     setLoading(true);
     setError(null);
     setProgress(0);
-    setProgressMessage('Загрузка файла...');
+    setProgressMessage('Начало анализа...');
+
+    // Start polling for progress
+    const progressInterval = setInterval(async () => {
+      try {
+        const progressData = await getProgress(uploadedFileId);
+        if (progressData.current > 0) {
+          const percentage = Math.round((progressData.current / progressData.total) * 100);
+          setProgress(percentage);
+          setProgressMessage(`Обработано ${progressData.current} из ${progressData.total} частей документа`);
+        }
+      } catch (err) {
+        console.error('Progress fetch error:', err);
+      }
+    }, 500);
 
     try {
-      setProgress(10);
-      setProgressMessage('Сохранение настроек модели...');
       await saveSettings(modelSettings);
-
-      setProgress(30);
-      setProgressMessage('Анализ документа...');
       
       const analysisResult = await analyzeDocument(uploadedFileId, instructions);
+      
+      clearInterval(progressInterval);
       
       setProgress(100);
       setProgressMessage('Анализ завершён');
@@ -125,6 +136,7 @@ function App() {
       setActiveTab('results');
 
     } catch (err) {
+      clearInterval(progressInterval);
       console.error('Analysis error:', err);
       setError(err.response?.data?.detail || err.message || 'Произошла ошибка при анализе');
     } finally {
@@ -270,7 +282,7 @@ function App() {
                     style={{ width: `${progress}%` }}
                   ></div>
                 </div>
-                <div className="progress-text">{progress}%</div>
+                <div className="progress-text">{progress}% завершено</div>
               </div>
             )}
 

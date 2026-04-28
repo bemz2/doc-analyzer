@@ -27,6 +27,18 @@ from app.database import (
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
 
+# Store analysis results in memory (for demo purposes)
+analysis_cache = {}
+
+# Store analysis progress
+analysis_progress = {}
+
+class LLMSettings(BaseModel):
+    provider: str
+    api_key: Optional[str] = ""
+    model: str
+    api_base: Optional[str] = None
+
 
 class SettingsRequest(BaseModel):
     provider: str
@@ -270,10 +282,29 @@ async def analyze_document(
     
     try:
         llm_config = get_effective_llm_settings()
-
+        
+        # Initialize progress
+        analysis_progress[file_id] = {
+            "status": "starting",
+            "message": "Начало анализа...",
+            "progress": 0,
+            "completed": 0,
+            "total": 0
+        }
+        
+        # Progress callback
+        def update_progress(message: str, progress: int, completed: int = 0, total: int = 0):
+            analysis_progress[file_id] = {
+                "status": "processing",
+                "message": message,
+                "progress": progress,
+                "completed": completed,
+                "total": total
+            }
+        
         # Perform analysis
         analyzer = DocumentAnalyzer(str(file_path), llm_config=llm_config)
-        report = analyzer.analyze(instructions)
+        report = analyzer.analyze(instructions, progress_callback=update_progress)
         
         # Generate report ID
         report_id = str(uuid.uuid4())
@@ -281,11 +312,29 @@ async def analyze_document(
         # Cache report
         analysis_cache[report_id] = report
         
+        # Update progress
+        analysis_progress[file_id] = {
+            "status": "generating_reports",
+            "message": "Генерация отчетов...",
+            "progress": 95,
+            "completed": 0,
+            "total": 0
+        }
+        
         # Generate reports
         generator = ReportGenerator(report)
         json_path = generator.generate_json(f"{report_id}.json")
         docx_path = generator.generate_docx(f"{report_id}.docx")
         html_path = generator.generate_html(f"{report_id}.html")
+        
+        # Complete
+        analysis_progress[file_id] = {
+            "status": "completed",
+            "message": "Анализ завершен!",
+            "progress": 100,
+            "completed": 0,
+            "total": 0
+        }
         
         logger.info(f"Analysis complete for file {file_id}, report ID: {report_id}")
         
@@ -329,6 +378,29 @@ async def get_report(report_id: str):
     
     report = analysis_cache[report_id]
     return report.model_dump()
+
+
+@app.get("/progress/{file_id}")
+async def get_progress(file_id: str):
+    """
+    Get analysis progress for a file.
+    
+    Args:
+        file_id: File identifier
+        
+    Returns:
+        Progress information
+    """
+    if file_id not in analysis_progress:
+        return {
+            "status": "not_found",
+            "message": "Анализ не найден",
+            "progress": 0,
+            "completed": 0,
+            "total": 0
+        }
+    
+    return analysis_progress[file_id]
 
 
 @app.get("/download/{report_id}/{format}")

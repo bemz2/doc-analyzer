@@ -69,4 +69,9 @@ export const downloadReport = async (reportId, format) => {
   link.remove();
 };
 
+export const getProgress = async (fileId) => {
+  const response = await api.get(`/progress/${fileId}`);
+  return response.data;
+};
+
 export default api;

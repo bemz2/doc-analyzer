@@ -117,8 +117,8 @@ class DocumentAnalyzer:
         total = len(chunks)
         
         # Use ThreadPoolExecutor for parallel processing
-        # Reduced max_workers to 2 to avoid rate limiting
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # Increased to 3 workers for better performance
+        with ThreadPoolExecutor(max_workers=3) as executor:
             # Submit all tasks
             future_to_chunk = {
                 executor.submit(
@@ -155,7 +155,7 @@ class DocumentAnalyzer:
                 completed += 1
                 if progress_callback:
                     progress = 30 + int((completed / total) * 60)
-                    progress_callback(f"Анализ частей ({completed}/{total})...", progress)
+                    progress_callback(f"Анализ частей ({completed}/{total})...", progress, completed, total)
         
         # Sort by chunk_id
         chunk_analyses.sort(key=lambda x: x.chunk_id)
