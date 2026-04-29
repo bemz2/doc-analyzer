@@ -13,6 +13,11 @@ const defaultLlmSettings = {
     apiKey: '',
     model: 'claude-3-5-sonnet-20241022'
   },
+  openrouter: {
+    apiBase: 'https://openrouter.ai/api/v1',
+    apiKey: '',
+    model: 'openai/gpt-4o-mini'
+  },
   custom: {
     apiBase: 'http://host.docker.internal:11434/v1',
     apiKey: 'ollama',

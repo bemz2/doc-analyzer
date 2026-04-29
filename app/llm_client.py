@@ -1,11 +1,13 @@
 """
 LLM client module for interacting with OpenAI and Anthropic APIs.
-Handles API calls, retries, and JSON response parsing.
+Handles API calls, retries, rate limiting, and JSON response parsing.
 """
 import json
 import logging
+import threading
 import time
-from typing import Optional, Dict, Any
+from collections import deque
+from typing import Optional, Dict, Any, List, Deque
 import openai
 import anthropic
 
@@ -14,6 +16,57 @@ from app.schemas import ChunkAnalysis, Finding
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
+
+
+OPENAI_COMPATIBLE_PROVIDER_DEFAULTS = {
+    "custom": {
+        "api_base": settings.custom_api_base,
+        "api_key": settings.custom_api_key,
+        "model": settings.custom_model,
+    },
+    "openrouter": {
+        "api_base": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "model": "openai/gpt-4o-mini",
+    },
+}
+
+
+class SlidingWindowRateLimiter:
+    """
+    Sliding window rate limiter to prevent hitting provider RPM limits.
+    Tracks timestamps of recent requests and enforces max_requests per window.
+    """
+
+    def __init__(self, max_requests: int = 10, window_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._timestamps: Deque[float] = deque()
+
+    def acquire(self) -> None:
+        """Block until a request slot is available."""
+        with self._lock:
+            now = time.time()
+            while self._timestamps and self._timestamps[0] < now - self.window_seconds:
+                self._timestamps.popleft()
+
+            if len(self._timestamps) >= self.max_requests:
+                oldest = self._timestamps[0]
+                wait_time = self.window_seconds - (now - oldest)
+                if wait_time > 0:
+                    logger.debug(f"Rate limit: sleeping {wait_time:.1f}s before next request")
+                    time.sleep(wait_time)
+                    now = time.time()
+                    while self._timestamps and self._timestamps[0] < now - self.window_seconds:
+                        self._timestamps.popleft()
+
+            self._timestamps.append(now)
+
+    def record_request(self) -> None:
+        """Record a completed request timestamp."""
+        with self._lock:
+            self._timestamps.append(time.time())
 
 
 class LLMClient:
@@ -28,7 +81,7 @@ class LLMClient:
     ):
         """Initialize LLM client based on configured provider."""
         self.provider = (provider or settings.llm_provider).strip().lower()
-        
+
         if self.provider == "openai":
             openai_api_key = (api_key or settings.openai_api_key).strip()
             if self._is_missing_or_placeholder_key(openai_api_key):
@@ -36,7 +89,7 @@ class LLMClient:
                     "OpenAI API key is not configured. Set OPENAI_API_KEY in .env "
                     "or enter a real key in model settings."
                 )
-            self.client = openai.OpenAI(api_key=openai_api_key, timeout=120.0, max_retries=2)
+            self.client = openai.OpenAI(api_key=openai_api_key, timeout=120.0, max_retries=0)
             self.model = (model or settings.openai_model).strip()
         elif self.provider == "anthropic":
             anthropic_api_key = (api_key or settings.anthropic_api_key).strip()
@@ -45,23 +98,42 @@ class LLMClient:
                     "Anthropic API key is not configured. Set ANTHROPIC_API_KEY in .env "
                     "or enter a real key in model settings."
                 )
-            self.client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=120.0, max_retries=2)
+            self.client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=120.0, max_retries=0)
             self.model = (model or settings.anthropic_model).strip()
-        elif self.provider == "custom":
-            custom_api_base = (api_base or settings.custom_api_base).strip()
+        else:
+            provider_defaults = OPENAI_COMPATIBLE_PROVIDER_DEFAULTS.get(self.provider, {})
+            custom_api_base = (api_base or provider_defaults.get("api_base") or "").strip()
             if not custom_api_base:
-                raise ValueError("CUSTOM_API_BASE not set in environment")
-            custom_api_key = (api_key or settings.custom_api_key).strip()
+                raise ValueError(
+                    f"API Base URL is not configured for provider '{self.provider}'. "
+                    "Enter an OpenAI-compatible /v1 base URL in model settings."
+                )
+            custom_api_key = (api_key or provider_defaults.get("api_key") or "").strip()
+            client_kwargs = {}
+            if self.provider == "openrouter":
+                client_kwargs["default_headers"] = {
+                    "HTTP-Referer": "http://localhost",
+                    "X-Title": "Document Analyzer",
+                }
             self.client = openai.OpenAI(
                 api_key=custom_api_key,
                 base_url=custom_api_base,
                 timeout=120.0,
-                max_retries=2
+                max_retries=0,
+                **client_kwargs,
             )
-            self.model = (model or settings.custom_model).strip()
-            logger.info(f"Initialized custom LLM client: {custom_api_base} with model {self.model}")
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.provider}")
+            self.model = (model or provider_defaults.get("model") or "").strip()
+            if not self.model:
+                raise ValueError(f"Model is not configured for provider '{self.provider}'")
+            logger.info(
+                f"Initialized OpenAI-compatible LLM client '{self.provider}': "
+                f"{custom_api_base} with model {self.model}"
+            )
+
+        self._rate_limiter = SlidingWindowRateLimiter(
+            max_requests=settings.max_requests_per_minute,
+            window_seconds=60.0
+        )
 
     @staticmethod
     def _is_missing_or_placeholder_key(api_key: str) -> bool:
@@ -92,10 +164,23 @@ class LLMClient:
         return status_code in {400, 401, 403, 404}
     
     @staticmethod
-    def _is_rate_limit_error(error: Exception) -> bool:
-        """Check if error is a rate limit error."""
+    def _is_rate_limit_error(error: Exception) -> tuple[bool, Optional[float]]:
+        """Check if error is a rate limit error. Returns (is_ratelimit, retry_after_seconds)."""
         status_code = getattr(error, "status_code", None)
-        return status_code == 429
+        if status_code != 429:
+            return False, None
+
+        retry_after = None
+        response = getattr(error, "response", None)
+        if response is not None:
+            retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+            if retry_after_header:
+                try:
+                    retry_after = float(retry_after_header)
+                except ValueError:
+                    pass
+
+        return True, retry_after
 
     def _format_llm_error(self, error: Exception) -> str:
         """Return a concise user-facing error while preserving provider context."""
@@ -115,8 +200,8 @@ class LLMClient:
         
         # Handle connection errors
         if "Connection" in message or "connection" in message.lower():
-            if self.provider == "custom":
-                return f"{self.provider}: Cannot connect to local server. Check if the server is running and accessible."
+            if self.provider not in {"openai", "anthropic"}:
+                return f"{self.provider}: Cannot connect to API Base URL. Check that the endpoint is reachable."
             return f"{self.provider}: Connection error. Check your internet connection."
         
         # Handle timeout errors
@@ -137,9 +222,6 @@ class LLMClient:
         Returns:
             ChunkAnalysis object or None if failed
         """
-        # Add small delay to avoid rate limiting
-        time.sleep(0.5)
-        
         prompt = self._build_chunk_analysis_prompt(chunk_text, instructions)
         
         last_error = None
@@ -152,13 +234,12 @@ class LLMClient:
                 last_error = e
                 logger.warning(f"Attempt {attempt + 1} failed for chunk {chunk_id}: {str(e)}")
                 
-                # Don't retry auth/permission errors
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
                 
-                # For rate limit errors, wait longer
-                if self._is_rate_limit_error(e):
-                    wait_time = settings.retry_delay * (attempt + 2)  # Exponential backoff
+                is_ratelimit, retry_after = self._is_rate_limit_error(e)
+                if is_ratelimit:
+                    wait_time = retry_after or (settings.retry_delay * (attempt + 1))
                     logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry")
                     time.sleep(wait_time)
                 elif attempt < settings.max_retries - 1:
@@ -169,6 +250,66 @@ class LLMClient:
         
         raise RuntimeError(self._format_llm_error(last_error))
     
+    def analyze_chunks_batch(
+        self,
+        chunks: list,
+        instructions: str,
+    ) -> List[ChunkAnalysis]:
+        """
+        Analyze a batch of chunks in a single LLM request.
+
+        Args:
+            chunks: List of dicts with keys `chunk_id` and `text`
+            instructions: User instructions
+
+        Returns:
+            List of ChunkAnalysis, one per input chunk (in same order).
+            If parsing fails, returns empty analyses for the whole batch.
+        """
+        if not chunks:
+            return []
+
+        if len(chunks) == 1:
+            c = chunks[0]
+            result = self.analyze_chunk(c["text"], c["chunk_id"], instructions)
+            return [result] if result else [
+                ChunkAnalysis(chunk_id=c["chunk_id"], summary="Анализ не удался", findings=[])
+            ]
+
+        prompt = self._build_batch_analysis_prompt(chunks, instructions)
+
+        last_error = None
+        for attempt in range(settings.max_retries):
+            try:
+                response = self._call_llm(prompt)
+                analyses = self._parse_batch_response(response, chunks)
+                return analyses
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"Batch attempt {attempt + 1} failed for chunks "
+                    f"{[c['chunk_id'] for c in chunks]}: {e}"
+                )
+
+                if self._is_non_retryable_error(e):
+                    raise RuntimeError(self._format_llm_error(e)) from e
+
+                is_ratelimit, retry_after = self._is_rate_limit_error(e)
+                if is_ratelimit:
+                    wait_time = retry_after or (settings.retry_delay * (attempt + 1))
+                    logger.warning(f"Rate limit hit, waiting {wait_time}s before retry")
+                    time.sleep(wait_time)
+                elif attempt < settings.max_retries - 1:
+                    time.sleep(settings.retry_delay)
+                else:
+                    logger.error(
+                        f"All retries failed for batch "
+                        f"{[c['chunk_id'] for c in chunks]}"
+                    )
+                    raise RuntimeError(self._format_llm_error(e)) from e
+
+        raise RuntimeError(self._format_llm_error(last_error))
+
     def global_analysis(self, summaries: list, all_findings: list, instructions: str) -> Dict[str, Any]:
         """
         Perform global analysis of the entire document.
@@ -193,13 +334,12 @@ class LLMClient:
                 last_error = e
                 logger.warning(f"Global analysis attempt {attempt + 1} failed: {str(e)}")
                 
-                # Don't retry auth/permission errors
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
                 
-                # For rate limit errors, wait longer
-                if self._is_rate_limit_error(e):
-                    wait_time = settings.retry_delay * (attempt + 2)  # Exponential backoff
+                is_ratelimit, retry_after = self._is_rate_limit_error(e)
+                if is_ratelimit:
+                    wait_time = retry_after or (settings.retry_delay * (attempt + 1))
                     logger.warning(f"Rate limit hit, waiting {wait_time} seconds before retry")
                     time.sleep(wait_time)
                 elif attempt < settings.max_retries - 1:
@@ -220,7 +360,9 @@ class LLMClient:
         Returns:
             Response text from LLM
         """
-        if self.provider == "openai" or self.provider == "custom":
+        self._rate_limiter.acquire()
+        
+        if self.provider != "anthropic":
             request_params = {
                 "model": self.model,
                 "messages": [
@@ -228,6 +370,7 @@ class LLMClient:
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": settings.temperature,
+                "max_tokens": settings.max_output_tokens,
             }
             if self.provider == "openai":
                 request_params["response_format"] = {"type": "json_object"}
@@ -240,7 +383,7 @@ class LLMClient:
         elif self.provider == "anthropic":
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=4096,
+                max_tokens=settings.max_output_tokens,
                 temperature=settings.temperature,
                 system="You are a document analysis expert. Always respond with valid JSON.",
                 messages=[
@@ -303,6 +446,111 @@ class LLMClient:
 
 Ответ должен быть валидным JSON."""
     
+    def _build_batch_analysis_prompt(self, chunks: List[dict], instructions: str) -> str:
+        """Build a single prompt asking the LLM to analyze several chunks at once."""
+        parts = []
+        for c in chunks:
+            parts.append(
+                f"--- ФРАГМЕНТ chunk_id={c['chunk_id']} ---\n{c['text']}"
+            )
+        chunks_block = "\n\n".join(parts)
+        ids = [c["chunk_id"] for c in chunks]
+
+        return f"""Проанализируй несколько фрагментов документа согласно инструкциям пользователя.
+Каждый фрагмент анализируй ОТДЕЛЬНО и верни результат для КАЖДОГО chunk_id.
+
+ИНСТРУКЦИИ ПОЛЬЗОВАТЕЛЯ:
+{instructions}
+
+ФРАГМЕНТЫ ДОКУМЕНТА (всего {len(chunks)}):
+{chunks_block}
+
+Верни результат СТРОГО в формате JSON:
+{{
+  "results": [
+    {{
+      "chunk_id": <int>,
+      "summary": "краткое содержание этого фрагмента (2-3 предложения)",
+      "findings": [
+        {{
+          "issue_type": "style | grammar | structure | logic | compliance | other",
+          "severity": "low | medium | high",
+          "quote": "цитата из текста где найдена проблема",
+          "problem": "описание проблемы",
+          "recommendation": "рекомендация по исправлению"
+        }}
+      ]
+    }}
+  ]
+}}
+
+Массив results должен содержать РОВНО {len(chunks)} элементов с chunk_id из списка: {ids}.
+Если в каком-то фрагменте проблем нет — верни пустой массив findings для этого chunk_id.
+Ответ должен быть валидным JSON."""
+
+    def _parse_batch_response(self, response: str, chunks: List[dict]) -> List[ChunkAnalysis]:
+        """Parse batch LLM response into list of ChunkAnalysis, preserving input order."""
+        expected_ids = [c["chunk_id"] for c in chunks]
+        try:
+            cleaned = self._clean_json_response(response)
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse batch JSON: {e}")
+            logger.error(f"Response was: {response[:500]}")
+            return [
+                ChunkAnalysis(chunk_id=cid, summary="Ошибка парсинга ответа", findings=[])
+                for cid in expected_ids
+            ]
+
+        # Accept either {"results": [...]} or a bare list
+        raw_results = data.get("results") if isinstance(data, dict) else data
+        if not isinstance(raw_results, list):
+            logger.error(f"Batch response has no 'results' list: {str(data)[:300]}")
+            return [
+                ChunkAnalysis(chunk_id=cid, summary="Ошибка парсинга ответа", findings=[])
+                for cid in expected_ids
+            ]
+
+        # Index returned items by chunk_id (fall back to positional mapping)
+        by_id: Dict[int, dict] = {}
+        positional: List[dict] = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("chunk_id")
+            if isinstance(cid, int):
+                by_id[cid] = item
+            positional.append(item)
+
+        analyses: List[ChunkAnalysis] = []
+        for idx, cid in enumerate(expected_ids):
+            item = by_id.get(cid)
+            if item is None and idx < len(positional):
+                item = positional[idx]
+            if item is None:
+                analyses.append(ChunkAnalysis(
+                    chunk_id=cid,
+                    summary="Ответ LLM не содержит данных для этого фрагмента",
+                    findings=[],
+                ))
+                continue
+
+            findings = []
+            for f in item.get("findings", []) or []:
+                findings.append(Finding(
+                    issue_type=f.get("issue_type", "other"),
+                    severity=f.get("severity", "low"),
+                    quote=f.get("quote", ""),
+                    problem=f.get("problem", ""),
+                    recommendation=f.get("recommendation", ""),
+                ))
+            analyses.append(ChunkAnalysis(
+                chunk_id=cid,
+                summary=item.get("summary", ""),
+                findings=findings,
+            ))
+        return analyses
+
     def _parse_chunk_response(self, response: str, chunk_id: int) -> ChunkAnalysis:
         """Parse LLM response into ChunkAnalysis object."""
         try:

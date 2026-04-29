@@ -307,6 +307,13 @@ body {
   gap: 20px;
 }
 
+.form-hint {
+  color: #718096;
+  margin-top: 5px;
+  display: block;
+  line-height: 1.4;
+}
+
 .token-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));

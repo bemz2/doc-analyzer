@@ -5,6 +5,7 @@ Provides REST API endpoints for document upload and analysis.
 import os
 import logging
 import uuid
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -87,7 +88,7 @@ analysis_cache = {}
 
 def get_default_llm_settings() -> dict:
     """Return environment-backed defaults when user settings are not saved yet."""
-    provider = settings.llm_provider
+    provider = settings.llm_provider.strip().lower()
     if provider == "custom":
         return {
             "provider": "custom",
@@ -101,6 +102,13 @@ def get_default_llm_settings() -> dict:
             "api_key": settings.anthropic_api_key,
             "model": settings.anthropic_model,
             "api_base": None,
+        }
+    if provider not in {"openai", "anthropic", "custom"}:
+        return {
+            "provider": provider,
+            "api_key": settings.custom_api_key,
+            "model": settings.custom_model,
+            "api_base": settings.custom_api_base,
         }
     return {
         "provider": "openai",
@@ -304,7 +312,7 @@ async def analyze_document(
         
         # Perform analysis
         analyzer = DocumentAnalyzer(str(file_path), llm_config=llm_config)
-        report = analyzer.analyze(instructions, progress_callback=update_progress)
+        report = await asyncio.to_thread(analyzer.analyze, instructions, update_progress)
         
         # Generate report ID
         report_id = str(uuid.uuid4())
@@ -479,18 +487,22 @@ async def save_user_settings(settings_data: SettingsRequest):
     """
     try:
         provider = settings_data.provider.strip().lower()
-        if provider not in {"openai", "anthropic", "custom"}:
-            raise HTTPException(status_code=400, detail="Unsupported provider")
+        api_base = (settings_data.api_base or "").strip()
+        if not provider:
+            raise HTTPException(status_code=400, detail="Provider is required")
         if not settings_data.model.strip():
             raise HTTPException(status_code=400, detail="Model is required")
-        if provider == "custom" and not (settings_data.api_base or "").strip():
-            raise HTTPException(status_code=400, detail="API Base URL is required for local models")
+        if provider not in {"openai", "anthropic"} and not api_base:
+            raise HTTPException(
+                status_code=400,
+                detail="API Base URL is required for OpenAI-compatible providers"
+            )
 
         save_settings(
             provider=provider,
             api_key=settings_data.api_key or "",
             model=settings_data.model.strip(),
-            api_base=(settings_data.api_base or "").strip() or None
+            api_base=api_base or None
         )
         return {
             "status": "success",
@@ -499,7 +511,7 @@ async def save_user_settings(settings_data: SettingsRequest):
                 "provider": provider,
                 "api_key": settings_data.api_key or "",
                 "model": settings_data.model.strip(),
-                "api_base": (settings_data.api_base or "").strip() or None,
+                "api_base": api_base or None,
             }
         }
     except HTTPException:

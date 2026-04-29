@@ -26,6 +26,20 @@ if 'report' not in st.session_state:
     st.session_state.report = None
 if 'report_paths' not in st.session_state:
     st.session_state.report_paths = {}
+if 'providers' not in st.session_state:
+    st.session_state.providers = {
+        "openai": {"name": "OpenAI", "type": "openai"},
+        "anthropic": {"name": "Anthropic", "type": "anthropic"},
+        "custom": {"name": "Local/Ollama", "type": "custom"},
+    }
+if 'selected_provider' not in st.session_state:
+    st.session_state.selected_provider = settings.llm_provider
+if 'provider_configs' not in st.session_state:
+    st.session_state.provider_configs = {
+        "openai": {"api_key": settings.openai_api_key, "model": settings.openai_model},
+        "anthropic": {"api_key": settings.anthropic_api_key, "model": settings.anthropic_model},
+        "custom": {"api_base": settings.custom_api_base, "api_key": settings.custom_api_key, "model": settings.custom_model},
+    }
 
 
 def progress_callback(message: str, progress: int):
@@ -44,8 +58,64 @@ def main():
     with st.sidebar:
         st.header("⚙️ Настройки")
         
-        st.info(f"**LLM Provider:** {settings.llm_provider}")
-        st.info(f"**Model:** {settings.openai_model if settings.llm_provider == 'openai' else settings.anthropic_model}")
+        # Provider selection
+        st.markdown("### LLM Провайдер")
+        
+        provider_options = list(st.session_state.providers.keys())
+        selected_provider = st.selectbox(
+            "Выберите провайдер",
+            provider_options,
+            index=provider_options.index(st.session_state.selected_provider) if st.session_state.selected_provider in provider_options else 0,
+            key="provider_select"
+        )
+        st.session_state.selected_provider = selected_provider
+        
+        # Show current provider config
+        current_config = st.session_state.provider_configs.get(selected_provider, {})
+        
+        if selected_provider == "openai":
+            api_key = st.text_input("OpenAI API Key", value=current_config.get("api_key", ""), type="password")
+            model = st.text_input("Model", value=current_config.get("model", settings.openai_model))
+            st.session_state.provider_configs["openai"] = {"api_key": api_key, "model": model}
+        elif selected_provider == "anthropic":
+            api_key = st.text_input("Anthropic API Key", value=current_config.get("api_key", ""), type="password")
+            model = st.text_input("Model", value=current_config.get("model", settings.anthropic_model))
+            st.session_state.provider_configs["anthropic"] = {"api_key": api_key, "model": model}
+        elif selected_provider == "custom":
+            api_base = st.text_input("API Base URL", value=current_config.get("api_base", settings.custom_api_base))
+            api_key = st.text_input("API Key", value=current_config.get("api_key", ""), type="password")
+            model = st.text_input("Model", value=current_config.get("model", settings.custom_model))
+            st.session_state.provider_configs["custom"] = {"api_base": api_base, "api_key": api_key, "model": model}
+        
+        # Add new provider
+        st.markdown("---")
+        st.markdown("### Добавить провайдер")
+        with st.expander("Добавить новый провайдер"):
+            new_provider_id = st.text_input("ID провайдера", placeholder="e.g., google, cohere")
+            new_provider_name = st.text_input("Название", placeholder="e.g., Google Gemini")
+            new_provider_type = st.selectbox("Тип", ["openai", "anthropic", "custom"])
+            
+            if st.button("Добавить провайдер"):
+                if new_provider_id and new_provider_name:
+                    st.session_state.providers[new_provider_id] = {"name": new_provider_name, "type": new_provider_type}
+                    st.session_state.provider_configs[new_provider_id] = {}
+                    st.success(f"Добавлен провайдер: {new_provider_name}")
+                else:
+                    st.warning("Заполните ID и название")
+        
+        # Remove provider
+        if len(st.session_state.providers) > 1:
+            remove_provider = st.selectbox("Удалить провайдер", list(st.session_state.providers.keys()))
+            if st.button("Удалить провайдер"):
+                if remove_provider:
+                    del st.session_state.providers[remove_provider]
+                    if remove_provider in st.session_state.provider_configs:
+                        del st.session_state.provider_configs[remove_provider]
+                    st.success(f"Удалён провайдер: {remove_provider}")
+        
+        st.markdown("---")
+        st.info(f"**Текущий провайдер:** {st.session_state.providers.get(selected_provider, {}).get('name', selected_provider)}")
+        st.info(f"**Model:** {current_config.get('model', 'N/A')}")
         st.info(f"**Chunk Size:** {settings.chunk_size} tokens")
         
         st.markdown("---")
@@ -101,8 +171,21 @@ def main():
             status_text = st.empty()
             
             try:
+                selected_provider = st.session_state.selected_provider
+                provider_config = st.session_state.provider_configs.get(selected_provider, {})
+                llm_config = {
+                    "provider": st.session_state.providers.get(selected_provider, {}).get("type", selected_provider),
+                }
+                
+                if provider_config.get("api_key"):
+                    llm_config["api_key"] = provider_config["api_key"]
+                if provider_config.get("model"):
+                    llm_config["model"] = provider_config["model"]
+                if provider_config.get("api_base"):
+                    llm_config["api_base"] = provider_config["api_base"]
+                
                 # Initialize analyzer
-                analyzer = DocumentAnalyzer(str(file_path))
+                analyzer = DocumentAnalyzer(str(file_path), llm_config=llm_config)
                 
                 # Custom progress callback
                 def update_progress(message, progress):

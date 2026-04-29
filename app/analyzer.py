@@ -4,7 +4,6 @@ Coordinates document loading, chunking, LLM analysis, and report generation.
 """
 import logging
 from typing import List, Optional, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.config import settings
 from app.document_loader import DocumentLoader
@@ -69,7 +68,7 @@ class DocumentAnalyzer:
         
         # Step 4: Analyze each chunk
         if progress_callback:
-            progress_callback(f"Анализ частей (0/{len(chunks)})...", 30)
+            progress_callback(f"Анализ частей (0/{len(chunks)})...", 30, 0, len(chunks))
         
         chunk_analyses = self._analyze_chunks(chunks, instructions, progress_callback)
         
@@ -101,69 +100,106 @@ class DocumentAnalyzer:
     
     def _analyze_chunks(self, chunks: List[dict], instructions: str, progress_callback=None) -> List[ChunkAnalysis]:
         """
-        Analyze all chunks in parallel.
-        
+        Analyze chunks sequentially in batches.
+
+        Batching groups `settings.batch_size` chunks into a single LLM request,
+        which drastically reduces the number of calls (and thus rate-limit hits)
+        for documents with many small chunks.
+
         Args:
             chunks: List of chunk dictionaries
             instructions: User instructions
             progress_callback: Optional progress callback
-            
+
         Returns:
-            List of ChunkAnalysis objects
+            List of ChunkAnalysis objects (sorted by chunk_id)
         """
-        chunk_analyses = []
-        failed_errors = []
-        completed = 0
+        chunk_analyses: List[ChunkAnalysis] = []
+        failed_errors: List[str] = []
         total = len(chunks)
-        
-        # Use ThreadPoolExecutor for parallel processing
-        # Using 1 worker to avoid rate limiting
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            # Submit all tasks
-            future_to_chunk = {
-                executor.submit(
-                    self.llm_client.analyze_chunk,
-                    chunk["text"],
-                    chunk["chunk_id"],
-                    instructions
-                ): chunk for chunk in chunks
-            }
-            
-            # Process completed tasks
-            for future in as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
-                try:
-                    analysis = future.result()
-                    if analysis:
-                        chunk_analyses.append(analysis)
-                    else:
-                        # Create empty analysis for failed chunks
-                        chunk_analyses.append(ChunkAnalysis(
-                            chunk_id=chunk["chunk_id"],
+        if total == 0:
+            return chunk_analyses
+
+        batch_size = self._get_effective_batch_size()
+        batches = [chunks[i:i + batch_size] for i in range(0, total, batch_size)]
+        logger.info(
+            f"Analyzing {total} chunks in {len(batches)} batch(es) of up to {batch_size}"
+        )
+
+        completed = 0
+        for batch_number, batch in enumerate(batches, start=1):
+            batch_ids = [c["chunk_id"] for c in batch]
+            if progress_callback:
+                first_chunk = completed + 1
+                last_chunk = min(completed + len(batch), total)
+                progress = 30 + int((completed / total) * 60)
+                progress_callback(
+                    f"Запрос к модели: части {first_chunk}-{last_chunk} из {total} "
+                    f"(батч {batch_number}/{len(batches)})...",
+                    progress,
+                    completed,
+                    total,
+                )
+            logger.info(
+                f"Sending batch {batch_number}/{len(batches)} to LLM "
+                f"for chunk ids {batch_ids}"
+            )
+            try:
+                results = self.llm_client.analyze_chunks_batch(batch, instructions)
+                logger.info(
+                    f"Received LLM response for batch {batch_number}/{len(batches)} "
+                    f"with chunk ids {batch_ids}"
+                )
+                # Ensure we have one result per chunk in batch
+                results_by_id = {r.chunk_id: r for r in results}
+                for chunk in batch:
+                    cid = chunk["chunk_id"]
+                    analysis = results_by_id.get(cid)
+                    if analysis is None:
+                        analysis = ChunkAnalysis(
+                            chunk_id=cid,
                             summary="Анализ не удался",
-                            findings=[]
-                        ))
-                except Exception as e:
-                    logger.error(f"Error analyzing chunk {chunk['chunk_id']}: {e}")
-                    failed_errors.append(str(e))
+                            findings=[],
+                        )
+                    chunk_analyses.append(analysis)
+            except Exception as e:
+                logger.error(f"Error analyzing batch {batch_ids}: {e}")
+                failed_errors.append(str(e))
+                for chunk in batch:
                     chunk_analyses.append(ChunkAnalysis(
                         chunk_id=chunk["chunk_id"],
-                        summary=f"Ошибка: {str(e)}",
-                        findings=[]
+                        summary=f"Ошибка: {e}",
+                        findings=[],
                     ))
-                
-                completed += 1
-                if progress_callback:
-                    progress = 30 + int((completed / total) * 60)
-                    progress_callback(f"Анализ частей ({completed}/{total})...", progress, completed, total)
-        
-        # Sort by chunk_id
+
+            completed += len(batch)
+            if progress_callback:
+                progress = 30 + int((completed / total) * 60)
+                progress_callback(
+                    f"Анализ частей ({completed}/{total})...",
+                    progress,
+                    completed,
+                    total,
+                )
+
         chunk_analyses.sort(key=lambda x: x.chunk_id)
 
-        if failed_errors and len(failed_errors) == total:
-            raise RuntimeError(f"All document chunks failed to analyze. First error: {failed_errors[0]}")
+        # Fail hard only if every batch errored out.
+        if failed_errors and len(failed_errors) == len(batches):
+            raise RuntimeError(
+                f"All document batches failed to analyze. First error: {failed_errors[0]}"
+            )
 
         return chunk_analyses
+
+    def _get_effective_batch_size(self) -> int:
+        """Keep slow/free aggregator models from stalling on large multi-chunk prompts."""
+        configured_batch_size = max(1, int(settings.batch_size))
+        provider = getattr(self.llm_client, "provider", "")
+        model = getattr(self.llm_client, "model", "")
+        if provider == "openrouter" and (":free" in model or "reasoning" in model.lower()):
+            return 1
+        return configured_batch_size
     
     def _perform_global_analysis(self, chunk_analyses: List[ChunkAnalysis], instructions: str) -> Optional[GlobalAnalysis]:
         """
