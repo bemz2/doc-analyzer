@@ -40,7 +40,10 @@ class Settings(BaseSettings):
     max_requests_per_minute: int = int(os.getenv("MAX_REQUESTS_PER_MINUTE", "8"))
     # Batching: how many chunks to send to the LLM in a single request.
     # 1 = legacy behavior (one request per chunk).
-    batch_size: int = int(os.getenv("BATCH_SIZE", "5"))
+    batch_size: int = int(os.getenv("BATCH_SIZE", "10"))
+    # Optional hard cap for estimated input tokens in one batch.
+    # 0 = derive from the selected model context window.
+    batch_max_input_tokens: int = int(os.getenv("BATCH_MAX_INPUT_TOKENS", "0"))
     # Delay (seconds) between consecutive LLM requests (batch-to-batch or chunk-to-chunk).
     request_delay: float = float(os.getenv("REQUEST_DELAY", "0.5"))
     

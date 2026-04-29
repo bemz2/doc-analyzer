@@ -8,8 +8,9 @@ from typing import List, Optional, Dict, Any
 from app.config import settings
 from app.document_loader import DocumentLoader
 from app.chunker import DocumentChunker
-from app.llm_client import LLMClient
+from app.llm_client import LLMClient, ProviderQuotaExceeded
 from app.schemas import AnalysisReport, ChunkAnalysis, GlobalAnalysis
+from app.token_calculator import get_model_context_window
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ class DocumentAnalyzer:
             return chunk_analyses
 
         batch_size = self._get_effective_batch_size()
-        batches = [chunks[i:i + batch_size] for i in range(0, total, batch_size)]
+        batches = self._build_batches(chunks, instructions, batch_size)
         logger.info(
             f"Analyzing {total} chunks in {len(batches)} batch(es) of up to {batch_size}"
         )
@@ -164,6 +165,8 @@ class DocumentAnalyzer:
                     chunk_analyses.append(analysis)
             except Exception as e:
                 logger.error(f"Error analyzing batch {batch_ids}: {e}")
+                if isinstance(e, ProviderQuotaExceeded):
+                    raise
                 failed_errors.append(str(e))
                 for chunk in batch:
                     chunk_analyses.append(ChunkAnalysis(
@@ -193,13 +196,56 @@ class DocumentAnalyzer:
         return chunk_analyses
 
     def _get_effective_batch_size(self) -> int:
-        """Keep slow/free aggregator models from stalling on large multi-chunk prompts."""
+        """Return configured batch size, with conservative handling for fragile free models."""
         configured_batch_size = max(1, int(settings.batch_size))
         provider = getattr(self.llm_client, "provider", "")
         model = getattr(self.llm_client, "model", "")
         if provider == "openrouter" and (":free" in model or "reasoning" in model.lower()):
             return 1
         return configured_batch_size
+
+    def _get_batch_token_budget(self, instructions: str) -> int:
+        """
+        Estimate a safe input-token budget for one LLM request.
+
+        The chunker already limits a single chunk, but batching needs a second
+        guard so several chunks do not exceed the selected model context.
+        """
+        if settings.batch_max_input_tokens > 0:
+            return max(1, int(settings.batch_max_input_tokens))
+
+        context_window = get_model_context_window(
+            self.llm_client.model,
+            fallback=max(settings.chunk_size * self._get_effective_batch_size(), settings.chunk_size),
+        )
+        prompt_overhead = self.chunker.count_tokens(instructions) + 2000
+        available = context_window - settings.max_output_tokens - prompt_overhead
+        return max(1, int(available * 0.85))
+
+    def _build_batches(self, chunks: List[dict], instructions: str, batch_size: int) -> List[List[dict]]:
+        """Group chunks by max count and estimated prompt token budget."""
+        token_budget = self._get_batch_token_budget(instructions)
+        batches: List[List[dict]] = []
+        current_batch: List[dict] = []
+        current_tokens = 0
+
+        for chunk in chunks:
+            chunk_tokens = int(chunk.get("token_count") or self.chunker.count_tokens(chunk.get("text", "")))
+            would_exceed_count = len(current_batch) >= batch_size
+            would_exceed_tokens = current_batch and current_tokens + chunk_tokens > token_budget
+
+            if would_exceed_count or would_exceed_tokens:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+            current_batch.append(chunk)
+            current_tokens += chunk_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
     
     def _perform_global_analysis(self, chunk_analyses: List[ChunkAnalysis], instructions: str) -> Optional[GlobalAnalysis]:
         """

@@ -32,36 +32,52 @@ OPENAI_COMPATIBLE_PROVIDER_DEFAULTS = {
 }
 
 
+class ProviderQuotaExceeded(RuntimeError):
+    """Raised when a provider reports a hard quota limit that retries cannot fix."""
+
+
 class SlidingWindowRateLimiter:
     """
     Sliding window rate limiter to prevent hitting provider RPM limits.
     Tracks timestamps of recent requests and enforces max_requests per window.
     """
 
-    def __init__(self, max_requests: int = 10, window_seconds: float = 60.0):
-        self.max_requests = max_requests
+    def __init__(
+        self,
+        max_requests: int = 10,
+        window_seconds: float = 60.0,
+        min_interval_seconds: float = 0.0,
+    ):
+        self.max_requests = max(1, max_requests)
         self.window_seconds = window_seconds
+        self.min_interval_seconds = max(0.0, min_interval_seconds)
         self._lock = threading.Lock()
         self._timestamps: Deque[float] = deque()
+        self._last_request_at: Optional[float] = None
 
     def acquire(self) -> None:
-        """Block until a request slot is available."""
-        with self._lock:
-            now = time.time()
-            while self._timestamps and self._timestamps[0] < now - self.window_seconds:
-                self._timestamps.popleft()
+        """Block until a request slot is available without sending bursts."""
+        while True:
+            with self._lock:
+                now = time.time()
+                while self._timestamps and self._timestamps[0] <= now - self.window_seconds:
+                    self._timestamps.popleft()
 
-            if len(self._timestamps) >= self.max_requests:
-                oldest = self._timestamps[0]
-                wait_time = self.window_seconds - (now - oldest)
-                if wait_time > 0:
-                    logger.debug(f"Rate limit: sleeping {wait_time:.1f}s before next request")
-                    time.sleep(wait_time)
-                    now = time.time()
-                    while self._timestamps and self._timestamps[0] < now - self.window_seconds:
-                        self._timestamps.popleft()
+                wait_times = []
+                if len(self._timestamps) >= self.max_requests:
+                    wait_times.append(self.window_seconds - (now - self._timestamps[0]))
 
-            self._timestamps.append(now)
+                if self._last_request_at is not None:
+                    wait_times.append(self.min_interval_seconds - (now - self._last_request_at))
+
+                wait_time = max(wait_times, default=0.0)
+                if wait_time <= 0:
+                    self._timestamps.append(now)
+                    self._last_request_at = now
+                    return
+
+            logger.debug(f"Rate limit: sleeping {wait_time:.1f}s before next request")
+            time.sleep(wait_time)
 
     def record_request(self) -> None:
         """Record a completed request timestamp."""
@@ -132,7 +148,11 @@ class LLMClient:
 
         self._rate_limiter = SlidingWindowRateLimiter(
             max_requests=settings.max_requests_per_minute,
-            window_seconds=60.0
+            window_seconds=60.0,
+            min_interval_seconds=max(
+                settings.request_delay,
+                60.0 / max(1, settings.max_requests_per_minute),
+            ),
         )
 
     @staticmethod
@@ -182,6 +202,23 @@ class LLMClient:
 
         return True, retry_after
 
+    @staticmethod
+    def _is_quota_exhausted_error(error: Exception) -> bool:
+        """Detect hard quota limits where retrying only burns more requests."""
+        status_code = getattr(error, "status_code", None)
+        if status_code != 429:
+            return False
+
+        message = str(error).lower()
+        hard_limit_markers = (
+            "free-models-per-day",
+            "x-ratelimit-remaining': '0",
+            '"x-ratelimit-remaining": "0',
+            "quota exceeded",
+            "daily limit",
+        )
+        return any(marker in message for marker in hard_limit_markers)
+
     def _format_llm_error(self, error: Exception) -> str:
         """Return a concise user-facing error while preserving provider context."""
         status_code = getattr(error, "status_code", None)
@@ -196,6 +233,11 @@ class LLMClient:
         if status_code == 400 and "model" in message.lower():
             return f"{self.provider}: model '{self.model}' is not available or does not support this request."
         if status_code == 429:
+            if self._is_quota_exhausted_error(error):
+                return (
+                    f"{self.provider}: daily/free quota is exhausted for model '{self.model}'. "
+                    "Switch to a paid/non-free model or wait for the provider quota reset."
+                )
             return f"{self.provider}: rate limit exceeded. Too many requests. Please wait and try again."
         
         # Handle connection errors
@@ -236,6 +278,9 @@ class LLMClient:
                 
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
+
+                if self._is_quota_exhausted_error(e):
+                    raise ProviderQuotaExceeded(self._format_llm_error(e)) from e
                 
                 is_ratelimit, retry_after = self._is_rate_limit_error(e)
                 if is_ratelimit:
@@ -294,6 +339,9 @@ class LLMClient:
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
 
+                if self._is_quota_exhausted_error(e):
+                    raise ProviderQuotaExceeded(self._format_llm_error(e)) from e
+
                 is_ratelimit, retry_after = self._is_rate_limit_error(e)
                 if is_ratelimit:
                     wait_time = retry_after or (settings.retry_delay * (attempt + 1))
@@ -336,6 +384,9 @@ class LLMClient:
                 
                 if self._is_non_retryable_error(e):
                     raise RuntimeError(self._format_llm_error(e)) from e
+
+                if self._is_quota_exhausted_error(e):
+                    raise ProviderQuotaExceeded(self._format_llm_error(e)) from e
                 
                 is_ratelimit, retry_after = self._is_rate_limit_error(e)
                 if is_ratelimit:

@@ -128,7 +128,7 @@ function App() {
       } catch (err) {
         console.error('Progress fetch error:', err);
       }
-    }, 500);
+    }, 2000);
 
     try {
       await saveSettings(modelSettings);
